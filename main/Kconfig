@@ -1,0 +1,12 @@
+menu "P4 Demos"
+
+choice BOARD
+    prompt "Target board"
+    default BOARD_P4_WAVESHARE
+
+config BOARD_P4_WAVESHARE
+    bool "Waveshare ESP32-P4-WIFI6-Touch-LCD-4B (720x720 ST7703)"
+
+endchoice
+
+endmenu
