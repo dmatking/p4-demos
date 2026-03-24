@@ -41,12 +41,16 @@
 #define DEMO_SECS 30
 #define NUM_STARS 800
 
-static uint8_t *fb;       // panel's live framebuffer (scanned by hardware)
-static uint8_t *backbuf;  // render buffer (draw here, then copy to fb)
-static uint8_t *fadebuf;  // PPA blend output buffer (swap with backbuf)
-static uint8_t *blackbuf; // all-zeros buffer for PPA fade-to-black blend
+static uint8_t *fb;         // panel's live framebuffer (scanned by hardware)
+static uint8_t *backbuf;    // render buffer (draw here, then copy to fb)
+static uint8_t *backbuf_a;  // double-buffer A
+static uint8_t *backbuf_b;  // double-buffer B
+static uint8_t *blackbuf;   // all-zeros buffer for PPA fade-to-black blend
 static esp_lcd_panel_handle_t panel;
 static ppa_client_handle_t ppa_blend_client;
+static ppa_client_handle_t ppa_srm_client;
+static SemaphoreHandle_t flush_done_sem;
+static bool flush_pending;
 
 // --- Sin/Hue lookup tables ---
 #define SIN_LUT_SIZE 1024
@@ -98,11 +102,55 @@ static inline void set_pixel_rgb(int x, int y, uint8_t r, uint8_t g, uint8_t b)
     p[0] = b; p[1] = g; p[2] = r;
 }
 
+// PPA SRM completion callback — signals semaphore from ISR context
+static bool flush_done_cb(ppa_client_handle_t client, ppa_event_data_t *event_data, void *user_data)
+{
+    BaseType_t woken = pdFALSE;
+    xSemaphoreGiveFromISR(flush_done_sem, &woken);
+    return (woken == pdTRUE);
+}
+
+// Wait for any in-flight async flush to complete
+static void flush_wait(void)
+{
+    if (flush_pending) {
+        xSemaphoreTake(flush_done_sem, portMAX_DELAY);
+        esp_cache_msync(fb, FB_SIZE, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+        esp_lcd_panel_draw_bitmap(panel, 0, 0, W, H, fb);
+        flush_pending = false;
+    }
+}
+
+// Start async DMA copy of backbuf → fb, then swap backbuf so CPU can
+// immediately begin rendering the next frame while the copy runs.
 static void flush(void)
 {
-    memcpy(fb, backbuf, FB_SIZE);
-    esp_cache_msync(fb, FB_SIZE, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
-    esp_lcd_panel_draw_bitmap(panel, 0, 0, W, H, fb);
+    flush_wait();
+    esp_cache_msync(backbuf, FB_SIZE, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+    ppa_srm_oper_config_t srm_cfg = {
+        .in = {
+            .buffer = backbuf,
+            .pic_w = W, .pic_h = H,
+            .block_w = W, .block_h = H,
+            .block_offset_x = 0, .block_offset_y = 0,
+            .srm_cm = PPA_SRM_COLOR_MODE_RGB888,
+        },
+        .out = {
+            .buffer = fb,
+            .buffer_size = FB_SIZE,
+            .pic_w = W, .pic_h = H,
+            .block_offset_x = 0, .block_offset_y = 0,
+            .srm_cm = PPA_SRM_COLOR_MODE_RGB888,
+        },
+        .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
+        .scale_x = 1.0f,
+        .scale_y = 1.0f,
+        .mode = PPA_TRANS_MODE_NON_BLOCKING,
+    };
+    ESP_ERROR_CHECK(ppa_do_scale_rotate_mirror(ppa_srm_client, &srm_cfg));
+    flush_pending = true;
+    // Swap to other backbuf — CPU can render next frame while DMA copies
+    backbuf = (backbuf == backbuf_a) ? backbuf_b : backbuf_a;
 }
 
 // ==========================================================================
@@ -170,26 +218,31 @@ static void display_init(void)
     ESP_ERROR_CHECK(esp_lcd_dpi_panel_get_frame_buffer(panel, 1, &fb0));
     fb = (uint8_t *)fb0;
 
-    // Allocate back buffer in PSRAM for tear-free rendering
-    backbuf = heap_caps_aligned_calloc(64, FB_SIZE, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
-    assert(backbuf);
+    // Allocate double back buffers in PSRAM for tear-free rendering
+    backbuf_a = heap_caps_aligned_calloc(64, FB_SIZE, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+    backbuf_b = heap_caps_aligned_calloc(64, FB_SIZE, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+    assert(backbuf_a && backbuf_b);
+    backbuf = backbuf_a;
     memset(fb, 0, FB_SIZE);
 
-    // Allocate PPA buffers for hardware-accelerated fade
-    fadebuf = heap_caps_aligned_calloc(64, FB_SIZE, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
-    assert(fadebuf);
+    // Allocate black buffer for PPA fade-to-black blend
     blackbuf = heap_caps_aligned_calloc(64, FB_SIZE, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
     assert(blackbuf);
 
-    // Register PPA blend client
-    ppa_client_config_t ppa_cfg = {
-        .oper_type = PPA_OPERATION_BLEND,
-        .max_pending_trans_num = 1,
-    };
-    ESP_ERROR_CHECK(ppa_register_client(&ppa_cfg, &ppa_blend_client));
+    // Register PPA clients
+    ppa_client_config_t blend_cfg = { .oper_type = PPA_OPERATION_BLEND, .max_pending_trans_num = 1 };
+    ESP_ERROR_CHECK(ppa_register_client(&blend_cfg, &ppa_blend_client));
+    ppa_client_config_t srm_cfg = { .oper_type = PPA_OPERATION_SRM, .max_pending_trans_num = 1 };
+    ESP_ERROR_CHECK(ppa_register_client(&srm_cfg, &ppa_srm_client));
+
+    // Register async flush callback and create semaphore
+    flush_done_sem = xSemaphoreCreateBinary();
+    assert(flush_done_sem);
+    ppa_event_callbacks_t srm_cbs = { .on_trans_done = flush_done_cb };
+    ESP_ERROR_CHECK(ppa_client_register_event_callbacks(ppa_srm_client, &srm_cbs));
 
     flush();
-    ESP_LOGI(TAG, "Display init done: %dx%d RGB888, fb=%p backbuf=%p (PPA enabled)", W, H, fb, backbuf);
+    ESP_LOGI(TAG, "Display init done: %dx%d RGB888, PPA SRM+blend enabled", W, H);
 }
 
 // ==========================================================================
@@ -442,7 +495,9 @@ static void run_mystify(void)
 {
     ESP_LOGI(TAG, "Mystify");
     srand(esp_timer_get_time());
-    memset(backbuf, 0, FB_SIZE);
+    flush_wait();
+    memset(backbuf_a, 0, FB_SIZE);
+    memset(backbuf_b, 0, FB_SIZE);
 
     mystify_poly_t polys[MYSTIFY_SHAPES];
     for (int s = 0; s < MYSTIFY_SHAPES; s++) {
@@ -461,42 +516,42 @@ static void run_mystify(void)
 
     while ((esp_timer_get_time() - start) < (int64_t)DEMO_SECS * 1000000) {
         // Fade toward black using PPA hardware blend
-        // BG = current image (alpha 255), FG = black (alpha ~16)
-        // Result: C_out = C_bg * (255-16)/255 ≈ C_bg * 0.937
-        esp_cache_msync(backbuf, FB_SIZE, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
-        ppa_blend_oper_config_t blend_cfg = {
-            .in_bg = {
-                .buffer = backbuf,
-                .pic_w = W, .pic_h = H,
-                .block_w = W, .block_h = H,
-                .block_offset_x = 0, .block_offset_y = 0,
-                .blend_cm = PPA_BLEND_COLOR_MODE_RGB888,
-            },
-            .in_fg = {
-                .buffer = blackbuf,
-                .pic_w = W, .pic_h = H,
-                .block_w = W, .block_h = H,
-                .block_offset_x = 0, .block_offset_y = 0,
-                .blend_cm = PPA_BLEND_COLOR_MODE_RGB888,
-            },
-            .out = {
-                .buffer = fadebuf,
-                .buffer_size = FB_SIZE,
-                .pic_w = W, .pic_h = H,
-                .block_offset_x = 0, .block_offset_y = 0,
-                .blend_cm = PPA_BLEND_COLOR_MODE_RGB888,
-            },
-            .bg_alpha_update_mode = PPA_ALPHA_NO_CHANGE,
-            .fg_alpha_update_mode = PPA_ALPHA_FIX_VALUE,
-            .fg_alpha_fix_val = 16,
-            .mode = PPA_TRANS_MODE_BLOCKING,
-        };
-        ESP_ERROR_CHECK(ppa_do_blend(ppa_blend_client, &blend_cfg));
-        esp_cache_msync(fadebuf, FB_SIZE, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
-        // Swap buffers — fadebuf becomes the new backbuf
-        uint8_t *tmp = backbuf;
-        backbuf = fadebuf;
-        fadebuf = tmp;
+        // After flush, backbuf was swapped — the previous frame is in the OTHER buffer.
+        // Blend: previous frame (faded) → current backbuf
+        {
+            uint8_t *prev = (backbuf == backbuf_a) ? backbuf_b : backbuf_a;
+            flush_wait(); // ensure previous flush finished reading prev
+            esp_cache_msync(prev, FB_SIZE, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+            ppa_blend_oper_config_t blend_cfg = {
+                .in_bg = {
+                    .buffer = prev,
+                    .pic_w = W, .pic_h = H,
+                    .block_w = W, .block_h = H,
+                    .block_offset_x = 0, .block_offset_y = 0,
+                    .blend_cm = PPA_BLEND_COLOR_MODE_RGB888,
+                },
+                .in_fg = {
+                    .buffer = blackbuf,
+                    .pic_w = W, .pic_h = H,
+                    .block_w = W, .block_h = H,
+                    .block_offset_x = 0, .block_offset_y = 0,
+                    .blend_cm = PPA_BLEND_COLOR_MODE_RGB888,
+                },
+                .out = {
+                    .buffer = backbuf,
+                    .buffer_size = FB_SIZE,
+                    .pic_w = W, .pic_h = H,
+                    .block_offset_x = 0, .block_offset_y = 0,
+                    .blend_cm = PPA_BLEND_COLOR_MODE_RGB888,
+                },
+                .bg_alpha_update_mode = PPA_ALPHA_NO_CHANGE,
+                .fg_alpha_update_mode = PPA_ALPHA_FIX_VALUE,
+                .fg_alpha_fix_val = 16,
+                .mode = PPA_TRANS_MODE_BLOCKING,
+            };
+            ESP_ERROR_CHECK(ppa_do_blend(ppa_blend_client, &blend_cfg));
+            esp_cache_msync(backbuf, FB_SIZE, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+        }
 
         // Draw current shape for each polygon, then update vertices
         for (int s = 0; s < MYSTIFY_SHAPES; s++) {
