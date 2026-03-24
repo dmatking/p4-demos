@@ -19,6 +19,7 @@
 #include "esp_lcd_st7703.h"
 #include "driver/gpio.h"
 #include "esp_heap_caps.h"
+#include "driver/ppa.h"
 
 #define TAG "APP"
 
@@ -42,7 +43,10 @@
 
 static uint8_t *fb;       // panel's live framebuffer (scanned by hardware)
 static uint8_t *backbuf;  // render buffer (draw here, then copy to fb)
+static uint8_t *fadebuf;  // PPA blend output buffer (swap with backbuf)
+static uint8_t *blackbuf; // all-zeros buffer for PPA fade-to-black blend
 static esp_lcd_panel_handle_t panel;
+static ppa_client_handle_t ppa_blend_client;
 
 // --- Sin/Hue lookup tables ---
 #define SIN_LUT_SIZE 1024
@@ -167,12 +171,25 @@ static void display_init(void)
     fb = (uint8_t *)fb0;
 
     // Allocate back buffer in PSRAM for tear-free rendering
-    backbuf = heap_caps_malloc(FB_SIZE, MALLOC_CAP_SPIRAM);
+    backbuf = heap_caps_aligned_calloc(64, FB_SIZE, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
     assert(backbuf);
-    memset(backbuf, 0, FB_SIZE);
     memset(fb, 0, FB_SIZE);
+
+    // Allocate PPA buffers for hardware-accelerated fade
+    fadebuf = heap_caps_aligned_calloc(64, FB_SIZE, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+    assert(fadebuf);
+    blackbuf = heap_caps_aligned_calloc(64, FB_SIZE, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+    assert(blackbuf);
+
+    // Register PPA blend client
+    ppa_client_config_t ppa_cfg = {
+        .oper_type = PPA_OPERATION_BLEND,
+        .max_pending_trans_num = 1,
+    };
+    ESP_ERROR_CHECK(ppa_register_client(&ppa_cfg, &ppa_blend_client));
+
     flush();
-    ESP_LOGI(TAG, "Display init done: %dx%d RGB888, fb=%p backbuf=%p", W, H, fb, backbuf);
+    ESP_LOGI(TAG, "Display init done: %dx%d RGB888, fb=%p backbuf=%p (PPA enabled)", W, H, fb, backbuf);
 }
 
 // ==========================================================================
@@ -382,6 +399,136 @@ static void run_starfield(void)
 }
 
 // ==========================================================================
+// Demo 5: Mystify (modern take on the classic Windows screensaver)
+// ==========================================================================
+#define MYSTIFY_SHAPES  2
+#define MYSTIFY_VERTS   4
+#define MYSTIFY_MARGIN  5
+
+typedef struct {
+    int x[MYSTIFY_VERTS];
+    int y[MYSTIFY_VERTS];
+    int dx[MYSTIFY_VERTS];
+    int dy[MYSTIFY_VERTS];
+    int base_hue;
+    int hue_speed;
+} mystify_poly_t;
+
+static void draw_line(int x0, int y0, int x1, int y1,
+                      uint8_t r, uint8_t g, uint8_t b, int thickness)
+{
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    int half = thickness / 2;
+
+    while (1) {
+        for (int oy = -half; oy <= half; oy++) {
+            for (int ox = -half; ox <= half; ox++) {
+                int px = x0 + ox, py = y0 + oy;
+                if (px >= 0 && px < W && py >= 0 && py < H) {
+                    set_pixel_rgb(px, py, r, g, b);
+                }
+            }
+        }
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+static void run_mystify(void)
+{
+    ESP_LOGI(TAG, "Mystify");
+    srand(esp_timer_get_time());
+    memset(backbuf, 0, FB_SIZE);
+
+    mystify_poly_t polys[MYSTIFY_SHAPES];
+    for (int s = 0; s < MYSTIFY_SHAPES; s++) {
+        mystify_poly_t *p = &polys[s];
+        for (int v = 0; v < MYSTIFY_VERTS; v++) {
+            p->x[v] = MYSTIFY_MARGIN + rand() % (W - 2 * MYSTIFY_MARGIN);
+            p->y[v] = MYSTIFY_MARGIN + rand() % (H - 2 * MYSTIFY_MARGIN);
+            p->dx[v] = (rand() % 4 + 2) * (rand() % 2 ? 1 : -1);
+            p->dy[v] = (rand() % 4 + 2) * (rand() % 2 ? 1 : -1);
+        }
+        p->base_hue = s * 120;
+        p->hue_speed = 1;
+    }
+
+    int64_t start = esp_timer_get_time();
+
+    while ((esp_timer_get_time() - start) < (int64_t)DEMO_SECS * 1000000) {
+        // Fade toward black using PPA hardware blend
+        // BG = current image (alpha 255), FG = black (alpha ~16)
+        // Result: C_out = C_bg * (255-16)/255 ≈ C_bg * 0.937
+        esp_cache_msync(backbuf, FB_SIZE, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+        ppa_blend_oper_config_t blend_cfg = {
+            .in_bg = {
+                .buffer = backbuf,
+                .pic_w = W, .pic_h = H,
+                .block_w = W, .block_h = H,
+                .block_offset_x = 0, .block_offset_y = 0,
+                .blend_cm = PPA_BLEND_COLOR_MODE_RGB888,
+            },
+            .in_fg = {
+                .buffer = blackbuf,
+                .pic_w = W, .pic_h = H,
+                .block_w = W, .block_h = H,
+                .block_offset_x = 0, .block_offset_y = 0,
+                .blend_cm = PPA_BLEND_COLOR_MODE_RGB888,
+            },
+            .out = {
+                .buffer = fadebuf,
+                .buffer_size = FB_SIZE,
+                .pic_w = W, .pic_h = H,
+                .block_offset_x = 0, .block_offset_y = 0,
+                .blend_cm = PPA_BLEND_COLOR_MODE_RGB888,
+            },
+            .bg_alpha_update_mode = PPA_ALPHA_NO_CHANGE,
+            .fg_alpha_update_mode = PPA_ALPHA_FIX_VALUE,
+            .fg_alpha_fix_val = 16,
+            .mode = PPA_TRANS_MODE_BLOCKING,
+        };
+        ESP_ERROR_CHECK(ppa_do_blend(ppa_blend_client, &blend_cfg));
+        esp_cache_msync(fadebuf, FB_SIZE, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+        // Swap buffers — fadebuf becomes the new backbuf
+        uint8_t *tmp = backbuf;
+        backbuf = fadebuf;
+        fadebuf = tmp;
+
+        // Draw current shape for each polygon, then update vertices
+        for (int s = 0; s < MYSTIFY_SHAPES; s++) {
+            mystify_poly_t *p = &polys[s];
+            int hue = p->base_hue % 360;
+            uint8_t r = hue_lut[hue][2];
+            uint8_t g = hue_lut[hue][1];
+            uint8_t b = hue_lut[hue][0];
+
+            for (int i = 0; i < MYSTIFY_VERTS; i++) {
+                int next = (i + 1) % MYSTIFY_VERTS;
+                draw_line(p->x[i], p->y[i], p->x[next], p->y[next], r, g, b, 3);
+            }
+
+            // Update vertices — bounce off edges
+            for (int v = 0; v < MYSTIFY_VERTS; v++) {
+                p->x[v] += p->dx[v];
+                p->y[v] += p->dy[v];
+                if (p->x[v] <= MYSTIFY_MARGIN)     { p->x[v] = MYSTIFY_MARGIN;     p->dx[v] =  abs(p->dx[v]); }
+                if (p->x[v] >= W - MYSTIFY_MARGIN)  { p->x[v] = W - MYSTIFY_MARGIN - 1; p->dx[v] = -abs(p->dx[v]); }
+                if (p->y[v] <= MYSTIFY_MARGIN)      { p->y[v] = MYSTIFY_MARGIN;     p->dy[v] =  abs(p->dy[v]); }
+                if (p->y[v] >= H - MYSTIFY_MARGIN)  { p->y[v] = H - MYSTIFY_MARGIN - 1; p->dy[v] = -abs(p->dy[v]); }
+            }
+
+            p->base_hue = (p->base_hue + p->hue_speed) % 360;
+        }
+
+        flush();
+    }
+}
+
+// ==========================================================================
 
 void app_main(void)
 {
@@ -395,5 +542,6 @@ void app_main(void)
         run_plasma();
         run_rainbow();
         run_starfield();
+        run_mystify();
     }
 }
