@@ -2,3 +2,8 @@ build/
 sdkconfig
 sdkconfig.old
 .cache/
+.claude/
+claude*.sh
+CLAUDE.md
+*.jpg
+*.png
