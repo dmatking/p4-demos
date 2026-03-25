@@ -15,7 +15,7 @@ Four demos cycle every 30 seconds:
 
 | Detail | Value |
 |--------|-------|
-| Board | Waveshare ESP32-P4-WIFI6-Touch-LCD-4B |
+| Board | [Waveshare ESP32-P4-WIFI6-Touch-LCD-4B](https://www.waveshare.com/esp32-p4-wifi6-touch-lcd-4b.htm) |
 | MCU | ESP32-P4 @ 360 MHz |
 | Display | 720×720 RGB888, ST7703 via MIPI-DSI (2 lanes, 480 Mbps) |
 | RAM | HEX PSRAM @ 200 MHz |
