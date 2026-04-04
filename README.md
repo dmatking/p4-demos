@@ -2,6 +2,8 @@
 
 Animated graphics demos for the **Waveshare ESP32-P4-WIFI6-Touch-LCD-4B** (720×720 ST7703 LCD, MIPI-DSI).
 
+> For chip-level notes on the P4+C6 combination (esp_hosted init, SDIO, PSRAM, errata, etc.) see [esp32-notes](https://github.com/dmatking/esp32-notes).
+
 ## Demos
 
 Four demos cycle every 30 seconds:
